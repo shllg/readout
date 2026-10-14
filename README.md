@@ -9,7 +9,7 @@ contract a server must implement is in [docs/api.md](docs/api.md).
 ## Install
 
 ```sh
-git clone <this repository> && cd readout
+git clone https://github.com/shllg/readout && cd readout
 ./install.sh
 ```
 
