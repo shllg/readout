@@ -241,6 +241,16 @@ dry "$FHID"
 check "folder: symlinks to hidden files are skipped" page.html \
   "$(jq -r '[.manifest.files[].path] | join(" ")' <<<"$OUT")"
 
+# Line breaks must never split one path into two: the second half could name any file.
+NLF="$TMP/nlf"; mkdir -p "$NLF"; : >"$NLF/page.md"; : >"$NLF/a"$'\n'"b.md"
+dry "$NLF"
+check "folder: a file name with a line break exits 2" 2 "$RC"
+has "folder: line break error" "line break" "$ERR"
+NLD="$TMP/nl"$'\n'"dir"; mkdir -p "$NLD"; : >"$NLD/page.md"
+dry "$NLD/page.md"
+check "a target path with a line break exits 2" 2 "$RC"
+has "target path error" "control character" "$ERR"
+
 MD="$TMP/md"; mkdir -p "$MD"
 printf '# Notes\n\n<img src="pic.png">\n' >"$MD/notes.md"; : >"$MD/pic.png"
 dry "$MD/notes.md"
@@ -313,6 +323,17 @@ check "a new page prints nothing on stderr" "" "$ERR"
 net 200 "${BODY/\"replaced\":false/\"replaced\":true}" "$FIX/single/report.html"
 check "replace prints the url only" https://readout.hillig.dev/p/abc "$OUT"
 check "replace says so on stderr" "readout: replaced existing page abc" "$ERR"
+
+# A symlinked reference whose target path contains a line break must not smuggle an extra file
+# part (here: a file outside the folder) into the upload.
+SPL="$TMP/spl"; mkdir -p "$SPL/x"$'\n'"$TMP"
+printf 'decoy\n' >"$SPL/x"$'\n'"$TMP/secret.js"; printf 'decoy\n' >"$SPL/x"; printf 'secret\n' >"$TMP/secret.js"
+printf '<script src="a.js"></script>\n' >"$SPL/page.html"; ln -s "x"$'\n'"$TMP/secret.js" "$SPL/a.js"
+net 201 "$BODY" "$SPL/page.html" --new
+check "split: publish still exits 0" 0 "$RC"
+check "split: one file part per manifest entry" 1 "$(grep -c '^f[0-9]*=@' "$FAKE_CURL_LOG")"
+case $(cat "$FAKE_CURL_LOG") in *"=@$TMP/secret.js"*) no "split: no part for a file outside the folder" ;; *) ok "split: no part for a file outside the folder" ;; esac
+has "split: skip warning" "readout: skipped a.js" "$ERR"
 net 201 "$BODY" "$FIX/single/report.html" --json
 check "publish --json prints the body" "$BODY" "$OUT"
 
@@ -322,7 +343,7 @@ RAW=$(cat "$FAKE_CURL_RAW_LOG")
 case $RAW in *tok123*) no "token is not in curl argv" ;; *) ok "token is not in curl argv" ;; esac
 case $RAW in *$'\n@'* | @*) ok "auth header is passed as a header file" ;; *) no "auth header is passed as a header file" ;; esac
 case $LOG in *"Transfer-Encoding"*) no "no chunked transfer encoding" ;; *) ok "no chunked transfer encoding" ;; esac
-has "sends the client header" "X-Readout-Client: cli/0.2.0" "$LOG"
+has "sends the client header" "X-Readout-Client: cli/0.2.1" "$LOG"
 has "posts to /api/v1/pages" "https://readout.hillig.dev/api/v1/pages" "$LOG"
 has "manifest part typed as json" '";type=application/json'  "$LOG"
 has "manifest part is named" "manifest=" "$LOG"
@@ -395,7 +416,7 @@ net 200 "" ls
 check "ls with an empty body exits 1" 1 "$RC"
 
 run "$CLI" version
-check "version output" "readout 0.2.0" "$OUT"
+check "version output" "readout 0.2.1" "$OUT"
 check "version exits 0" 0 "$RC"
 run "$CLI" ls
 check "ls without a token exits 3" 3 "$RC"

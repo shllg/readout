@@ -3,7 +3,7 @@
 # Needs bash, curl and jq. See docs/api.md for the HTTP contract.
 set -euo pipefail
 
-READOUT_VERSION=0.2.0
+READOUT_VERSION=0.2.1
 DEFAULT_URL=https://readout.hillig.dev
 
 # Byte-wise matching: path validation must not depend on the user's locale.
@@ -178,6 +178,9 @@ json_body() { # require a JSON body
 FILES_LINES=''
 add_file() {
   check_path "$2"
+  # A control character, above all a line break, could split one path into two on its way to
+  # curl, and the second half could name any file.
+  case $1 in *[[:cntrl:]]*) die 2 "the path of $2 contains a control character" ;; esac
   FILES_LINES+=$(jq -nc --arg field "f$FILE_COUNT" --arg path "$2" --arg abs "$1" \
     '{field: $field, path: $path, abs: $abs}')
   FILES_LINES+=$'\n'
@@ -185,10 +188,14 @@ add_file() {
 }
 
 collect_files() { # collect_files <path>
-  local target=$1 canon list rel f real
+  local target=$1 canon bad list rel f real
   FILE_COUNT=0
   if [ -d "$target" ]; then
     canon=$(resolve "$target") || die 2 "cannot read $target"
+    # The listing below is one path per line, so a name with a line break would split in two.
+    bad=$(cd "$canon" && find -P . -mindepth 1 \
+      \( -name '.*' -o -name node_modules \) -prune -o -name '*[[:cntrl:]]*' -print)
+    [ -z "$bad" ] || die 2 "a file name in $target contains a line break or another control character"
     list=$(cd "$canon" && find -P . -mindepth 1 \
       \( -name '.*' -o -name node_modules \) -prune -o \
       \( -type f -o -type l \) -print | sort)
@@ -271,6 +278,7 @@ collect_html_refs() {
     fi
     real=$(resolve "$dir/$ref") || { warn "skipped $ref: broken symlink"; continue; }
     case $real in
+      *[[:cntrl:]]*) warn "skipped $ref: its target path contains a control character"; continue ;;
       "$dir"/*) ;;
       *) warn "skipped $ref: symlink points outside the folder"; continue ;;
     esac
@@ -375,7 +383,8 @@ cmd_publish() {
   esc=${manifest//\\/\\\\}
   esc=${esc//\"/\\\"}
   args+=(-F "manifest=\"${esc}\";type=application/json")
-  while IFS= read -r abs; do
+  # NUL-separated: no byte that can occur in a path ends a record.
+  while IFS= read -r -d '' abs; do
     case $abs in
       *[\;,\"\\]*)
         abs=${abs//\\/\\\\}
@@ -385,7 +394,7 @@ cmd_publish() {
       *) args+=(-F "f$i=@$abs") ;;
     esac
     i=$((i + 1))
-  done < <(printf '%s' "$files" | jq -r '.[].abs')
+  done < <(printf '%s' "$files" | jq -j '.[].abs + "\u0000"')
 
   request POST pages "${args[@]}"
   expect_ok 200 201
