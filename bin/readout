@@ -3,7 +3,7 @@
 # Needs bash, curl and jq. See docs/api.md for the HTTP contract.
 set -euo pipefail
 
-READOUT_VERSION=0.1.0
+READOUT_VERSION=0.2.0
 DEFAULT_URL=https://readout.hillig.dev
 
 # Byte-wise matching: path validation must not depend on the user's locale.
@@ -12,7 +12,7 @@ export LC_ALL=C
 usage() {
   cat <<'USAGE'
 Usage:
-  readout [publish] <file|dir> [--title T] [--entry PATH] [--name NAME]
+  readout [publish] <file|dir> [--title T] [--entry PATH] [--name NAME | --new]
                                [--ttl 90m|1h|7d|...] [--keep] [--json]
   readout ls [--json]
   readout rm <id>
@@ -202,6 +202,9 @@ collect_files() { # collect_files <path>
           "$canon"/*) [ -f "$real" ] || continue ;;
           *) die 2 "symlink points outside the folder: $rel" ;;
         esac
+        # A symlink to a dotfile is skipped like the dotfile itself.
+        case /${real#"$canon"/} in */.*) continue ;; esac
+        f=$real
       fi
       add_file "$f" "$rel"
     done <<<"$list"
@@ -209,13 +212,104 @@ collect_files() { # collect_files <path>
   elif [ -f "$target" ]; then
     canon=$(resolve "$target") || die 2 "cannot read $target"
     add_file "$canon" "$(basename -- "$target")"
+    case $target in
+      *.[Hh][Tt][Mm][Ll] | *.[Hh][Tt][Mm]) collect_html_refs "$canon" "$(basename -- "$target")" ;;
+    esac
   else
     die 2 "no such file or folder: $target"
   fi
 }
 
+# html_refs <file>: the quoted src and href values of asset tags (script, link, img, source,
+# video, audio) in an HTML file, one per line. Text that only looks like an attribute, in prose
+# or inside a script, does not count. A tag split across lines is missed, which fails safe.
+html_refs() {
+  { grep -oiE '<(script|link|img|source|video|audio)[[:space:]][^>]*>' "$1" || true; } |
+    { grep -oiE "[[:space:]](src|href)[[:space:]]*=[[:space:]]*(\"[^\"]*\"|'[^']*')" || true; } |
+    sed -E 's/^[^=]*=[[:space:]]*.//; s/.$//'
+}
+
+# is_asset <path>: true for file types a page loads (scripts, styles, images, fonts, media), so
+# a reference can never pull in a key, a config file or another document.
+is_asset() {
+  local ext
+  ext=$(printf '%s' "${1##*.}" | tr '[:upper:]' '[:lower:]')
+  case $ext in
+    js | mjs | css | png | jpg | jpeg | gif | svg | webp | avif | ico | bmp | \
+      woff | woff2 | ttf | otf | mp4 | webm | ogg | mp3 | wav | m4a) return 0 ;;
+  esac
+  return 1
+}
+
+warn() { printf 'readout: %s\n' "$1" >&2; }
+
+# collect_html_refs <canonical html path> <its published path>: add the local assets the page
+# references by a relative src or href, so a single page keeps its scripts, styles and images.
+# Only existing files inside the page's folder count; hidden files and parent paths never do. A
+# reference that cannot be published is skipped with a warning instead of failing the publish.
+collect_html_refs() {
+  local dir refs ref real msg
+  dir=$(dirname -- "$1")
+  refs=$(html_refs "$1" | while IFS= read -r ref; do
+    ref=${ref%%#*}
+    ref=${ref%%\?*}
+    while [ "${ref#./}" != "$ref" ]; do ref=${ref#./}; done
+    case /$ref in
+      / | //* | */.*) continue ;; # empty, root- or protocol-relative, hidden or .. segment
+    esac
+    case $ref in *:*) continue ;; esac # a scheme: https:, data:, mailto:
+    [ "$ref" != "$2" ] || continue
+    is_asset "$ref" || continue
+    [ -f "$dir/$ref" ] || continue
+    printf '%s\n' "$ref"
+  done | sort -u)
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    if ! msg=$(check_path "$ref" 2>&1); then
+      warn "skipped $ref: ${msg#readout: }"
+      continue
+    fi
+    real=$(resolve "$dir/$ref") || { warn "skipped $ref: broken symlink"; continue; }
+    case $real in
+      "$dir"/*) ;;
+      *) warn "skipped $ref: symlink points outside the folder"; continue ;;
+    esac
+    case /${real#"$dir"/} in
+      */.*) warn "skipped $ref: points to a hidden file"; continue ;;
+    esac
+    # Upload the path that was checked, not one a symlink could swap in between.
+    add_file "$real" "$ref"
+  done <<<"$refs"
+}
+
+# sha256_hex: the hex SHA-256 of stdin, from sha256sum (Linux), shasum (macOS) or openssl.
+sha256_hex() {
+  local out
+  if command -v sha256sum >/dev/null 2>&1; then
+    out=$(sha256sum)
+  elif command -v shasum >/dev/null 2>&1; then
+    out=$(shasum -a 256)
+  elif command -v openssl >/dev/null 2>&1; then
+    out=$(openssl dgst -sha256 -r)
+  else
+    return 1
+  fi
+  printf '%s' "${out%% *}"
+}
+
+# default_name <canonical path>: the page name when --name is not given. The same file or folder
+# on the same machine always gets the same name, so publishing it again replaces the page and keeps
+# its URL. Changing this format makes every later publish start a new page.
+default_name() {
+  local digest
+  digest=$(printf '%s:%s' "$(uname -n)" "$1" | sha256_hex) ||
+    die 3 "sha256sum, shasum or openssl is required to name the page (or pass --name or --new)"
+  [[ $digest =~ ^[0-9a-f]{64}$ ]] || die 3 "could not hash the path to name the page (pass --name or --new)"
+  printf 'path:%s' "${digest:0:16}"
+}
+
 cmd_publish() {
-  local target='' title='' entry='' name='' ttl='' keep=0 json=0
+  local target='' title='' entry='' name='' ttl='' keep=0 json=0 new=0
   while [ $# -gt 0 ]; do
     case $1 in
       --title | --entry | --name | --ttl)
@@ -230,6 +324,7 @@ cmd_publish() {
         ;;
       --keep) keep=1; shift ;;
       --json) json=1; shift ;;
+      --new) new=1; shift ;;
       -h | --help) usage; exit 0 ;;
       -*) usage_error "unknown option: $1" ;;
       *)
@@ -240,6 +335,7 @@ cmd_publish() {
     esac
   done
   [ -n "$target" ] || usage_error "no file or folder given"
+  [ "$new" -eq 0 ] || [ -z "$name" ] || usage_error "--new and --name cannot be combined"
 
   local ttl_s=null
   if [ -n "$ttl" ]; then
@@ -249,6 +345,13 @@ cmd_publish() {
 
   need_tools
   collect_files "$target"
+  # A page with its references has several files; the server cannot pick the entry by itself.
+  if [ -f "$target" ] && [ "$FILE_COUNT" -gt 1 ] && [ -z "$entry" ]; then
+    entry=$(basename -- "$target")
+  fi
+  if [ -z "$name" ] && [ "$new" -eq 0 ]; then
+    name=$(default_name "$(resolve "$target")") || exit $?
+  fi
 
   local files manifest keep_json=false
   [ "$keep" -eq 0 ] || keep_json=true
@@ -287,6 +390,10 @@ cmd_publish() {
   request POST pages "${args[@]}"
   expect_ok 200 201
   json_body
+  # A publish under an existing name replaces that page; say so, the URL alone does not show it.
+  local replaced
+  replaced=$(printf '%s' "$HTTP_BODY" | jq -r 'if .replaced == true then .id else empty end')
+  [ -z "$replaced" ] || warn "replaced existing page $replaced"
   if [ "$json" -eq 1 ]; then
     printf '%s\n' "$HTTP_BODY"
   else

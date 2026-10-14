@@ -141,6 +141,138 @@ run "$CLI" "$FIX/single/report.html"
 check "missing token exits 3" 3 "$RC"
 check "missing token message" "readout: READOUT_TOKEN is not set" "$ERR"
 
+echo "dry run: local references of a single html file"
+
+ASSETS="$TMP/assets"
+mkdir -p "$ASSETS/sub" "$ASSETS/.hidden"
+cat >"$ASSETS/review.html" <<'HTML'
+<!doctype html>
+<title>Review</title>
+<link rel="stylesheet" href="style.css">
+<script src="marked.min.js"></script>
+<script SRC='mermaid.min.js'></script>
+<script src="./marked.min.js"></script>
+<img src="sub/pic.png?v=1#top">
+<a href="page2.html#part">Part two</a>
+<a href="#overview">Overview</a>
+<a href="https://example.com/x.js">external</a>
+<script src="//cdn.example.com/x.js"></script>
+<img src="data:image/png;base64,AAAA">
+<a href="mailto:me@example.com">mail</a>
+<script src="/root.js"></script>
+<a href="../outside.html">up</a>
+<script src="../outside.js"></script>
+<script src=".hidden/x.js"></script>
+<img src="missing.png">
+<a href="review.html">self</a>
+<a href="sub">a folder</a>
+HTML
+for f in style.css marked.min.js mermaid.min.js page2.html sub/pic.png .hidden/x.js root.js unreferenced.js; do
+  : >"$ASSETS/$f"
+done
+: >"$TMP/outside.html"; : >"$TMP/outside.js"
+ASSETS_C=$(cd -P "$ASSETS" && pwd -P)
+dry "$ASSETS/review.html"
+check "html: exits 0" 0 "$RC"
+check "html: the page plus its local asset references, sorted" \
+  "review.html marked.min.js mermaid.min.js style.css sub/pic.png" \
+  "$(jq -r '[.manifest.files[].path] | join(" ")' <<<"$OUT")"
+check "html: entry is the page" review.html "$(jq -r '.manifest.entry' <<<"$OUT")"
+check "html: references carry abs" "$ASSETS_C/sub/pic.png" "$(jq -r '.files[4].abs' <<<"$OUT")"
+dry "$ASSETS/review.html" --entry style.css
+check "html: --entry wins" style.css "$(jq -r '.manifest.entry' <<<"$OUT")"
+
+# Only src/href attributes of asset tags count, and only for asset file types: text that merely
+# looks like an attribute, links to other documents and non-asset files are never uploaded.
+TXT="$TMP/txt"; mkdir -p "$TXT/config"
+cat >"$TXT/page.html" <<'HTML'
+<!doctype html>
+<p>set href="config/app.js" in prose</p>
+<pre>src="config/app.css"</pre>
+<script>var s = 'href="config/app.js"';</script>
+<img src="config/master.key">
+<img data-src="config/lazy.png">
+<a href="other.html">another report</a>
+<link rel="stylesheet" href="config/app.css">
+<script src="ok.js"></script>
+HTML
+for f in config/app.js config/app.css config/master.key config/lazy.png other.html ok.js; do : >"$TXT/$f"; done
+dry "$TXT/page.html"
+check "html: only asset tags and asset types" "page.html config/app.css ok.js" \
+  "$(jq -r '[.manifest.files[].path] | join(" ")' <<<"$OUT")"
+
+ESC="$TMP/esc"; mkdir -p "$ESC"
+printf '<script src="leak.js"></script>\n<script src="ok.js"></script>\n' >"$ESC/page.html"
+ln -s "$FIX/single/report.html" "$ESC/leak.js"; : >"$ESC/ok.js"
+dry "$ESC/page.html"
+check "html: symlinked reference outside the folder is skipped" 0 "$RC"
+check "html: the rest is still published" "page.html ok.js" "$(jq -r '[.manifest.files[].path] | join(" ")' <<<"$OUT")"
+has "html: skip warning names the reference" "readout: skipped leak.js" "$ERR"
+
+HID="$TMP/hid"; mkdir -p "$HID/.secret"
+printf '<script src="envlink.js"></script>\n<script src="dirlink/x.js"></script>\n' >"$HID/page.html"
+: >"$HID/.env"; : >"$HID/.secret/x.js"; ln -s .env "$HID/envlink.js"; ln -s .secret "$HID/dirlink"
+dry "$HID/page.html"
+check "html: references resolving to hidden files are skipped" page.html \
+  "$(jq -r '[.manifest.files[].path] | join(" ")' <<<"$OUT")"
+has "html: hidden skip warning" "readout: skipped envlink.js" "$ERR"
+
+ODD="$TMP/odd"; mkdir -p "$ODD/a"
+printf '<link rel="stylesheet" href="a//b.css">\n<img src="photo(1).png">\n<script src="ok.js"></script>\n' >"$ODD/page.html"
+: >"$ODD/a/b.css"; : >"$ODD/photo(1).png"; : >"$ODD/ok.js"
+dry "$ODD/page.html"
+check "html: invalid reference paths do not stop the publish" 0 "$RC"
+check "html: invalid reference paths are skipped" "page.html ok.js" \
+  "$(jq -r '[.manifest.files[].path] | join(" ")' <<<"$OUT")"
+has "html: invalid path warning" "readout: skipped photo(1).png" "$ERR"
+
+INS="$TMP/ins"; mkdir -p "$INS"
+printf '<script src="alias.js"></script>\n' >"$INS/page.html"
+printf 'x\n' >"$INS/real.js"; ln -s real.js "$INS/alias.js"
+INS_C=$(cd -P "$INS" && pwd -P)
+dry "$INS/page.html"
+check "html: symlinked reference inside the folder accepted" "page.html alias.js" \
+  "$(jq -r '[.manifest.files[].path] | join(" ")' <<<"$OUT")"
+check "html: a symlinked reference uploads the checked target" "$INS_C/real.js" "$(jq -r '.files[1].abs' <<<"$OUT")"
+
+FHID="$TMP/fhid"; mkdir -p "$FHID"
+: >"$FHID/page.html"; : >"$FHID/.env"; ln -s .env "$FHID/alias.md"
+dry "$FHID"
+check "folder: symlinks to hidden files are skipped" page.html \
+  "$(jq -r '[.manifest.files[].path] | join(" ")' <<<"$OUT")"
+
+MD="$TMP/md"; mkdir -p "$MD"
+printf '# Notes\n\n<img src="pic.png">\n' >"$MD/notes.md"; : >"$MD/pic.png"
+dry "$MD/notes.md"
+check "markdown: references are not collected" notes.md "$(jq -r '[.manifest.files[].path] | join(" ")' <<<"$OUT")"
+
+echo "dry run: default name"
+
+sha16() { # first 16 hex chars of sha256(<text>)
+  local h
+  h=$(printf '%s' "$1" | { sha256sum 2>/dev/null || shasum -a 256; })
+  printf '%s' "${h:0:16}"
+}
+HOST=$(uname -n)
+SINGLE_C="$(cd -P "$FIX/single" && pwd -P)/report.html"
+dry "$FIX/single/report.html"
+check "default name: path: plus the hashed host and canonical path" \
+  "path:$(sha16 "$HOST:$SINGLE_C")" "$(jq -r '.manifest.name' <<<"$OUT")"
+FILE_NAME=$(jq -r '.manifest.name' <<<"$OUT")
+ln -s "$FIX/single/report.html" "$TMP/link.html"
+dry "$TMP/link.html"
+check "default name: a symlink names the file it points to" "$FILE_NAME" "$(jq -r '.manifest.name' <<<"$OUT")"
+SITE_C=$(cd -P "$FIX/site" && pwd -P)
+dry "$FIX/site"
+check "default name: a folder hashes its canonical path" \
+  "path:$(sha16 "$HOST:$SITE_C")" "$(jq -r '.manifest.name' <<<"$OUT")"
+check "default name: different paths, different names" yes \
+  "$([ "$FILE_NAME" != "$(jq -r '.manifest.name' <<<"$OUT")" ] && echo yes || echo no)"
+dry "$FIX/single/report.html" --new
+check "--new sends no name" false "$(jq '.manifest | has("name")' <<<"$OUT")"
+dry "$FIX/single/report.html" --new --name k
+check "--new with --name exits 2" 2 "$RC"
+
 # ------------------------------------------------------------- https only
 echo "READOUT_URL scheme"
 for u in https://example.com http://localhost http://localhost:8787 http://localhost:8787/ \
@@ -177,6 +309,10 @@ BODY='{"id":"abc","url":"https://readout.hillig.dev/p/abc","title":"Report","exp
 net 201 "$BODY" "$FIX/single/report.html"
 check "publish exits 0" 0 "$RC"
 check "publish prints the url only" https://readout.hillig.dev/p/abc "$OUT"
+check "a new page prints nothing on stderr" "" "$ERR"
+net 200 "${BODY/\"replaced\":false/\"replaced\":true}" "$FIX/single/report.html"
+check "replace prints the url only" https://readout.hillig.dev/p/abc "$OUT"
+check "replace says so on stderr" "readout: replaced existing page abc" "$ERR"
 net 201 "$BODY" "$FIX/single/report.html" --json
 check "publish --json prints the body" "$BODY" "$OUT"
 
@@ -186,7 +322,7 @@ RAW=$(cat "$FAKE_CURL_RAW_LOG")
 case $RAW in *tok123*) no "token is not in curl argv" ;; *) ok "token is not in curl argv" ;; esac
 case $RAW in *$'\n@'* | @*) ok "auth header is passed as a header file" ;; *) no "auth header is passed as a header file" ;; esac
 case $LOG in *"Transfer-Encoding"*) no "no chunked transfer encoding" ;; *) ok "no chunked transfer encoding" ;; esac
-has "sends the client header" "X-Readout-Client: cli/0.1.0" "$LOG"
+has "sends the client header" "X-Readout-Client: cli/0.2.0" "$LOG"
 has "posts to /api/v1/pages" "https://readout.hillig.dev/api/v1/pages" "$LOG"
 has "manifest part typed as json" '";type=application/json'  "$LOG"
 has "manifest part is named" "manifest=" "$LOG"
@@ -259,7 +395,7 @@ net 200 "" ls
 check "ls with an empty body exits 1" 1 "$RC"
 
 run "$CLI" version
-check "version output" "readout 0.1.0" "$OUT"
+check "version output" "readout 0.2.0" "$OUT"
 check "version exits 0" 0 "$RC"
 run "$CLI" ls
 check "ls without a token exits 3" 3 "$RC"
@@ -292,6 +428,17 @@ check "curl missing exits 3" 3 "$RC"
 has "curl missing names the tool" "curl" "$ERR"
 run env PATH="$TOOLS" READOUT_TOKEN=x READOUT_CURL=/nonexistent/curl "$BASH_BIN" "$CLI" whoami
 check "READOUT_CURL missing exits 3" 3 "$RC"
+# TOOLS has no sha256sum, shasum or openssl. These runs execute jq, so link one that works on a
+# bare PATH; a version-manager shim may only work on the full one.
+ln -sf "$CURL_BIN" "$TOOLS/curl"
+for j in $(type -aP jq); do
+  if env PATH="$TOOLS" "$j" -n 1 >/dev/null 2>&1; then ln -sf "$j" "$TOOLS/jq"; break; fi
+done
+run env PATH="$TOOLS" READOUT_DRY_RUN=1 "$BASH_BIN" "$CLI" "$FIX/spaces"
+check "no sha256 tool exits 3" 3 "$RC"
+has "no sha256 tool names the tools" "sha256sum, shasum or openssl" "$ERR"
+run env PATH="$TOOLS" READOUT_DRY_RUN=1 "$BASH_BIN" "$CLI" "$FIX/spaces" --new
+check "no sha256 tool: --new still publishes" 0 "$RC"
 
 echo
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
