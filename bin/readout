@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+# readout - publish a file or folder and get back a URL to read it.
+# Needs bash, curl and jq. See docs/api.md for the HTTP contract.
+set -euo pipefail
+
+READOUT_VERSION=0.1.0
+DEFAULT_URL=https://readout.hillig.dev
+
+# Byte-wise matching: path validation must not depend on the user's locale.
+export LC_ALL=C
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  readout [publish] <file|dir> [--title T] [--entry PATH] [--name NAME]
+                               [--ttl 90m|1h|7d|...] [--keep] [--json]
+  readout ls [--json]
+  readout rm <id>
+  readout whoami
+  readout version
+
+Environment:
+  READOUT_TOKEN    API key (required, except for version and a dry run)
+  READOUT_URL      server origin (default https://readout.hillig.dev)
+  READOUT_DRY_RUN  1 prints the manifest and target instead of sending
+USAGE
+}
+
+die() { # die <exit code> <message>
+  printf 'readout: %s\n' "$2" >&2
+  exit "$1"
+}
+
+usage_error() {
+  printf 'readout: %s\n' "$1" >&2
+  usage >&2
+  exit 2
+}
+
+CURL=${READOUT_CURL:-curl}
+
+# check_url: READOUT_URL must be https, except for loopback hosts (any port).
+check_url() {
+  local u=${READOUT_URL:-$DEFAULT_URL}
+  case $u in
+    https://*) return 0 ;;
+    http://localhost | http://localhost:[0-9]* | http://localhost/* | \
+      http://127.0.0.1 | http://127.0.0.1:[0-9]* | http://127.0.0.1/* | \
+      'http://[::1]' | 'http://[::1]:'[0-9]* | 'http://[::1]/'*)
+      case ${u#http://} in *@*) ;; *) return 0 ;; esac
+      ;;
+  esac
+  die 2 "READOUT_URL must use https (got $u)"
+}
+
+need_tools() {
+  check_url
+  command -v "$CURL" >/dev/null 2>&1 || die 3 "curl is required but was not found ($CURL)"
+  command -v jq >/dev/null 2>&1 || die 3 "jq is required but was not found"
+}
+
+need_token() {
+  [ -n "${READOUT_TOKEN:-}" ] || die 3 "READOUT_TOKEN is not set"
+}
+
+base_url() {
+  local u=${READOUT_URL:-$DEFAULT_URL}
+  printf '%s' "${u%/}"
+}
+
+# Resolve symlinks to a canonical absolute path. Portable: realpath is missing on old macOS.
+resolve() {
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -- "$1" 2>/dev/null
+    return
+  fi
+  local p=$1 dir link n=0
+  while [ -L "$p" ] && [ "$n" -lt 40 ]; do
+    link=$(readlink "$p")
+    case $link in
+      /*) p=$link ;;
+      *) p="$(dirname -- "$p")/$link" ;;
+    esac
+    n=$((n + 1))
+  done
+  [ -e "$p" ] || return 1
+  if [ -d "$p" ]; then
+    (cd -P -- "$p" && pwd -P)
+  else
+    dir=$(cd -P -- "$(dirname -- "$p")" && pwd -P) || return 1
+    printf '%s/%s\n' "$dir" "$(basename -- "$p")"
+  fi
+}
+
+# ttl_seconds <value>: 90m, 1h, 7d -> seconds. Returns 1 when malformed.
+ttl_seconds() {
+  case $1 in
+    *[!0-9mhd]* | '' | [mhd]*) return 1 ;;
+  esac
+  local n=${1%[mhd]} unit=${1#"${1%?}"}
+  case $n in '' | *[!0-9]*) return 1 ;; esac
+  case $unit in
+    m) echo $((10#$n * 60)) ;;
+    h) echo $((10#$n * 3600)) ;;
+    d) echo $((10#$n * 86400)) ;;
+    *) return 1 ;;
+  esac
+}
+
+# check_path <relative path>: enforce the v1 path rules (docs/api.md).
+check_path() {
+  local p=$1
+  if ! [[ $p =~ ^[A-Za-z0-9._@+\ /-]+$ ]]; then
+    die 2 "invalid path \"$p\": only A-Z a-z 0-9 . _ @ + - space are allowed"
+  fi
+  [ "${#p}" -le 255 ] || die 2 "invalid path \"$p\": longer than 255 bytes"
+  local IFS=/ seg n=0
+  # shellcheck disable=SC2086 # splitting on / is the point
+  set -- $p
+  for seg in "$@"; do
+    n=$((n + 1))
+    case $seg in
+      '' | . | ..) die 2 "invalid path \"$p\": empty, . or .. segment" ;;
+    esac
+  done
+  [ "$n" -le 8 ] || die 2 "invalid path \"$p\": more than 8 segments"
+}
+
+# ---------------------------------------------------------------- HTTP helpers
+
+# The token goes to curl through a header file (process substitution), never argv,
+# so it stays out of ps and /proc/*/cmdline.
+# request <method> <path> [curl args...]: sets HTTP_STATUS and HTTP_BODY.
+request() {
+  local method=$1 path=$2 out rc=0
+  shift 2
+  # -q must come first: it stops curl reading ~/.curlrc, whose options would apply to the token request.
+  out=$("$CURL" -q -sS -X "$method" -w '\n%{http_code}' \
+    -H @<(printf 'Authorization: Bearer %s\n' "$READOUT_TOKEN") \
+    -H "X-Readout-Client: cli/$READOUT_VERSION" \
+    "$@" "$(base_url)/api/v1/$path") || rc=$?
+  [ "$rc" -eq 0 ] || die 1 "request failed (curl exit $rc)"
+  case $out in
+    *$'\n'*)
+      HTTP_STATUS=${out##*$'\n'}
+      HTTP_BODY=${out%$'\n'*}
+      ;;
+    *)
+      HTTP_STATUS=$out
+      HTTP_BODY=
+      ;;
+  esac
+}
+
+# fail_http: report an error response and exit 1.
+fail_http() {
+  local msg
+  if [ -n "$HTTP_BODY" ] &&
+    msg=$(printf '%s' "$HTTP_BODY" | jq -er '.error | select(type == "object") | "\(.message) (\(.code))"' 2>/dev/null); then
+    die 1 "$msg"
+  fi
+  die 1 "HTTP $HTTP_STATUS"
+}
+
+expect_ok() { # expect_ok <status>...
+  local s
+  for s in "$@"; do [ "$HTTP_STATUS" = "$s" ] && return 0; done
+  fail_http
+}
+
+json_body() { # require a JSON body
+  printf '%s' "$HTTP_BODY" | jq -e . >/dev/null 2>&1 || die 1 "unexpected response (HTTP $HTTP_STATUS)"
+}
+
+# ------------------------------------------------------------------ commands
+
+# add_file <abs path> <relative path>: append to FILES_JSON, one jq call per file.
+FILES_LINES=''
+add_file() {
+  check_path "$2"
+  FILES_LINES+=$(jq -nc --arg field "f$FILE_COUNT" --arg path "$2" --arg abs "$1" \
+    '{field: $field, path: $path, abs: $abs}')
+  FILES_LINES+=$'\n'
+  FILE_COUNT=$((FILE_COUNT + 1))
+}
+
+collect_files() { # collect_files <path>
+  local target=$1 canon list rel f real
+  FILE_COUNT=0
+  if [ -d "$target" ]; then
+    canon=$(resolve "$target") || die 2 "cannot read $target"
+    list=$(cd "$canon" && find -P . -mindepth 1 \
+      \( -name '.*' -o -name node_modules \) -prune -o \
+      \( -type f -o -type l \) -print | sort)
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      rel=${rel#./}
+      f="$canon/$rel"
+      if [ -L "$f" ]; then
+        real=$(resolve "$f") || die 2 "broken symlink: $rel"
+        case $real in
+          "$canon"/*) [ -f "$real" ] || continue ;;
+          *) die 2 "symlink points outside the folder: $rel" ;;
+        esac
+      fi
+      add_file "$f" "$rel"
+    done <<<"$list"
+    [ "$FILE_COUNT" -gt 0 ] || die 2 "nothing to publish in $target"
+  elif [ -f "$target" ]; then
+    canon=$(resolve "$target") || die 2 "cannot read $target"
+    add_file "$canon" "$(basename -- "$target")"
+  else
+    die 2 "no such file or folder: $target"
+  fi
+}
+
+cmd_publish() {
+  local target='' title='' entry='' name='' ttl='' keep=0 json=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --title | --entry | --name | --ttl)
+        [ $# -ge 2 ] || usage_error "$1 needs a value"
+        case $1 in
+          --title) title=$2 ;;
+          --entry) entry=$2 ;;
+          --name) name=$2 ;;
+          --ttl) ttl=$2 ;;
+        esac
+        shift 2
+        ;;
+      --keep) keep=1; shift ;;
+      --json) json=1; shift ;;
+      -h | --help) usage; exit 0 ;;
+      -*) usage_error "unknown option: $1" ;;
+      *)
+        [ -z "$target" ] || usage_error "only one file or folder can be published"
+        target=$1
+        shift
+        ;;
+    esac
+  done
+  [ -n "$target" ] || usage_error "no file or folder given"
+
+  local ttl_s=null
+  if [ -n "$ttl" ]; then
+    [ "$keep" -eq 0 ] || die 2 "--keep and --ttl cannot be combined"
+    ttl_s=$(ttl_seconds "$ttl") || die 2 "invalid --ttl \"$ttl\": use a number with m, h or d (for example 90m, 12h, 7d)"
+  fi
+
+  need_tools
+  collect_files "$target"
+
+  local files manifest keep_json=false
+  [ "$keep" -eq 0 ] || keep_json=true
+  files=$(printf '%s' "$FILES_LINES" | jq -s '.')
+  manifest=$(jq -nc --arg title "$title" --arg entry "$entry" --arg name "$name" \
+    --argjson ttl "$ttl_s" --argjson keep "$keep_json" --argjson files "$files" '
+    {title: $title, entry: $entry, name: $name}
+    | with_entries(select(.value != ""))
+    | (if $keep then .keep = true elif $ttl != null then .ttl = $ttl else . end)
+    | .files = ($files | map({field, path}))')
+
+  if [ "${READOUT_DRY_RUN:-}" = 1 ]; then
+    jq -n --arg url "$(base_url)/api/v1/pages" --argjson manifest "$manifest" --argjson files "$files" \
+      '{url: $url, manifest: $manifest, files: $files}'
+    return 0
+  fi
+  need_token
+
+  local args=() i=0 abs esc
+  # Quote the value: an unquoted ";" in the JSON would cut the part short.
+  esc=${manifest//\\/\\\\}
+  esc=${esc//\"/\\\"}
+  args+=(-F "manifest=\"${esc}\";type=application/json")
+  while IFS= read -r abs; do
+    case $abs in
+      *[\;,\"\\]*)
+        abs=${abs//\\/\\\\}
+        abs=${abs//\"/\\\"}
+        args+=(-F "f$i=@\"$abs\"")
+        ;;
+      *) args+=(-F "f$i=@$abs") ;;
+    esac
+    i=$((i + 1))
+  done < <(printf '%s' "$files" | jq -r '.[].abs')
+
+  request POST pages "${args[@]}"
+  expect_ok 200 201
+  json_body
+  if [ "$json" -eq 1 ]; then
+    printf '%s\n' "$HTTP_BODY"
+  else
+    printf '%s' "$HTTP_BODY" | jq -er '.url // empty' || die 1 "response has no url"
+  fi
+}
+
+cmd_ls() {
+  local json=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --json) json=1 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+    shift
+  done
+  need_tools
+  need_token
+  request GET pages
+  expect_ok 200
+  json_body
+  if [ "$json" -eq 1 ]; then
+    printf '%s\n' "$HTTP_BODY"
+  else
+    printf '%s' "$HTTP_BODY" |
+      jq -r '.pages[]? | "\(.id)  \(.expiresAt // "keep")  \(.title)"'
+  fi
+}
+
+cmd_rm() {
+  [ $# -eq 1 ] || usage_error "rm needs exactly one page id"
+  [[ $1 =~ ^[A-Za-z0-9_-]+$ ]] || die 2 "invalid page id: $1"
+  need_tools
+  need_token
+  request DELETE "pages/$1"
+  expect_ok 204 200
+}
+
+cmd_whoami() {
+  [ $# -eq 0 ] || usage_error "whoami takes no arguments"
+  need_tools
+  need_token
+  request GET me
+  expect_ok 200
+  json_body
+  printf '%s' "$HTTP_BODY" | jq -er '.email' || die 1 "response has no email"
+}
+
+main() {
+  local sub=publish
+  if [ $# -gt 0 ]; then
+    case $1 in
+      publish | ls | rm | whoami | version) sub=$1; shift ;;
+      --version) sub=version; shift ;;
+      -h | --help | help) usage; exit 0 ;;
+    esac
+  fi
+  case $sub in
+    publish) cmd_publish "$@" ;;
+    ls) cmd_ls "$@" ;;
+    rm) cmd_rm "$@" ;;
+    whoami) cmd_whoami "$@" ;;
+    version) printf 'readout %s\n' "$READOUT_VERSION" ;;
+  esac
+}
+
+main "$@"

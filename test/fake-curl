@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Stand-in for curl in tests. Records one argument per line to $FAKE_CURL_LOG, then prints
+# $FAKE_CURL_BODY and a final line with $FAKE_CURL_STATUS, as the CLI's -w format expects.
+# FAKE_CURL_EXIT, when set, makes it fail with that exit code and print nothing.
+# FAKE_CURL_RAW_LOG records the argv exactly as received (what ps would show).
+# FAKE_CURL_LOG records the effective arguments: "-H @file" is replaced by the file's lines.
+if [ -n "${FAKE_CURL_RAW_LOG:-}" ]; then
+  for a in "$@"; do printf '%s\n' "$a"; done >>"$FAKE_CURL_RAW_LOG"
+fi
+if [ -n "${FAKE_CURL_LOG:-}" ]; then
+  prev=
+  for a in "$@"; do
+    if [ "$prev" = -H ] && [ "${a#@}" != "$a" ]; then
+      cat "${a#@}"
+    else
+      printf '%s\n' "$a"
+    fi
+    prev=$a
+  done >>"$FAKE_CURL_LOG"
+fi
+if [ -n "${FAKE_CURL_EXIT:-}" ]; then
+  echo "curl: (${FAKE_CURL_EXIT}) fake failure" >&2
+  exit "$FAKE_CURL_EXIT"
+fi
+printf '%s\n%s' "${FAKE_CURL_BODY:-}" "${FAKE_CURL_STATUS:-200}"
