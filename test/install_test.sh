@@ -37,7 +37,7 @@ check "bin link" "$ROOT/bin/readout" "$(readlink "$(BIN_L)")"
 check "claude skill link" "$ROOT/skills/readout" "$(readlink "$(CLAUDE_L)")"
 check "agents skill link" "$ROOT/skills/readout" "$(readlink "$(AGENTS_L)")"
 [ -x "$(BIN_L)" ] && ok "linked CLI is executable" || no "linked CLI is executable"
-check "linked CLI runs" "readout 0.2.1" "$(HOME="$H" "$(BIN_L)" version)"
+check "linked CLI runs" "readout 0.2.2" "$(HOME="$H" "$(BIN_L)" version)"
 
 echo "re-run"
 inst

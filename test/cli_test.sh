@@ -343,7 +343,7 @@ RAW=$(cat "$FAKE_CURL_RAW_LOG")
 case $RAW in *tok123*) no "token is not in curl argv" ;; *) ok "token is not in curl argv" ;; esac
 case $RAW in *$'\n@'* | @*) ok "auth header is passed as a header file" ;; *) no "auth header is passed as a header file" ;; esac
 case $LOG in *"Transfer-Encoding"*) no "no chunked transfer encoding" ;; *) ok "no chunked transfer encoding" ;; esac
-has "sends the client header" "X-Readout-Client: cli/0.2.1" "$LOG"
+has "sends the client header" "X-Readout-Client: cli/0.2.2" "$LOG"
 has "posts to /api/v1/pages" "https://readout.hillig.dev/api/v1/pages" "$LOG"
 has "manifest part typed as json" '";type=application/json'  "$LOG"
 has "manifest part is named" "manifest=" "$LOG"
@@ -416,7 +416,7 @@ net 200 "" ls
 check "ls with an empty body exits 1" 1 "$RC"
 
 run "$CLI" version
-check "version output" "readout 0.2.1" "$OUT"
+check "version output" "readout 0.2.2" "$OUT"
 check "version exits 0" 0 "$RC"
 run "$CLI" ls
 check "ls without a token exits 3" 3 "$RC"
